@@ -12,6 +12,15 @@
 
 namespace {
 
+// The device proxy hands out Xbox-ABI heaps: slots 9 and 10 return the 8-byte handle in RAX, with no hidden return
+// pointer (d3d12_xs_device.cpp, heap_get_cpu_handle). Called through the PC C++ declaration, the slot never writes
+// the hidden pointer in RDX, and the caller reads an uninitialised stack word.
+using XboxHeapHandleFn = std::uint64_t(WINAPI*)(void* heap);
+
+std::uint64_t xbox_heap_handle(void* heap, unsigned slot) {
+    return reinterpret_cast<XboxHeapHandleFn>((*static_cast<void***>(heap))[slot])(heap);
+}
+
 template <class T>
 struct Ref {
     T* p = nullptr;
@@ -65,8 +74,12 @@ bool check_console_addressed_heap(ID3D12Device* device) {
 }
 
 bool check_xs_proxy_slot14(ID3D12Device* real_device) {
+    // create_device_proxy takes one reference to the real device on success (d3d12_xs_device.h) and releases it
+    // with the proxy; main's Ref still owns its own.
+    real_device->AddRef();
     void* proxy_raw = nullptr;
     if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, __uuidof(ID3D12Device), &proxy_raw)) || !proxy_raw) {
+        real_device->Release();
         std::fprintf(stderr, "create_device_proxy failed\n");
         return false;
     }
@@ -91,11 +104,16 @@ bool check_xs_proxy_slot14(ID3D12Device* real_device) {
                      static_cast<unsigned long>(hr));
         return false;
     }
-    const auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
-    if (cpu.ptr != static_cast<SIZE_T>(console.address)) {
+    const std::uint64_t cpu = xbox_heap_handle(heap.get(), 9);
+    if (cpu != console.address) {
         std::fprintf(stderr, "proxy CPU heap start mismatch: got 0x%llx want 0x%llx\n",
-                     static_cast<unsigned long long>(cpu.ptr),
-                     static_cast<unsigned long long>(console.address));
+                     static_cast<unsigned long long>(cpu), static_cast<unsigned long long>(console.address));
+        return false;
+    }
+    const std::uint64_t gpu = xbox_heap_handle(heap.get(), 10);
+    if (gpu != console.address) {
+        std::fprintf(stderr, "proxy GPU heap start mismatch: got 0x%llx want 0x%llx\n",
+                     static_cast<unsigned long long>(gpu), static_cast<unsigned long long>(console.address));
         return false;
     }
     return true;
