@@ -9,6 +9,8 @@
 //   - allocation failures in the proxy (operator new, the arrays it unwraps), injected in this executable only;
 //   - --fail-virtualalloc / --fail-virtualprotect / --fail-veh: the guard region's setup failing, injected by
 //     patching this executable's own import table before the first proxy table is built (one process each).
+//   - device slot 14 with the desc at a page end before a no-access or guard page, and with words after it: nothing
+//     past the 16-byte PC desc is read without a console heap factory, and only readable memory with one.
 // Every device, queue, fence and resource here is a mock that records the calls it gets. No game data, no Xbox DLLs.
 #include "../shims/d3d12_xs_device.h"
 
@@ -1239,6 +1241,133 @@ int check_console_command_list() {
     return 0;
 }
 
+// ---- Device slot 14: nothing past the 16-byte PC desc is read without a console heap factory ----
+
+namespace {
+
+struct FactoryCalls {
+    int calls;
+    const D3D12_DESCRIPTOR_HEAP_DESC* desc;
+    std::uint64_t address;
+    std::uint64_t size;
+};
+FactoryCalls g_factory{};
+
+HRESULT fake_console_heap_factory(ID3D12Device*, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                  D3D12_GPU_VIRTUAL_ADDRESS address, std::uint64_t size, REFIID riid, void** out) {
+    ++g_factory.calls;
+    g_factory.desc = desc;
+    g_factory.address = address;
+    g_factory.size = size;
+    return mock_query(new_mock(Kind::heap), &riid, out);
+}
+
+// Device slot 14 with a fault caught: true when the call faulted (a read past the desc into the page after it).
+// No C++ object lives in this frame, so structured exception handling works under /EHsc.
+bool slot14_faults(void* device, const D3D12_DESCRIPTOR_HEAP_DESC* desc, void** out, HRESULT* hr) {
+    static const IID heap_iid = __uuidof(ID3D12DescriptorHeap);
+    __try {
+        *hr = hr_of(raw(device, 14, word(desc), word(&heap_iid), word(out)));
+        return false;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ||
+                        GetExceptionCode() == STATUS_GUARD_PAGE_VIOLATION
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH) {
+        return true;
+    }
+}
+
+// Two committed read/write pages, the second then set to `second_protect`. A desc placed in the last 16 bytes of
+// the first page has nothing readable after it.
+std::uint8_t* two_pages(std::size_t page, DWORD second_protect) {
+    auto* base = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, page * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    DWORD old = 0;
+    if (base && !VirtualProtect(base + page, page, second_protect, &old)) {
+        VirtualFree(base, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    return base;
+}
+
+// True while the page still has PAGE_GUARD: a read of it clears the bit (and raises the guard-page exception).
+bool still_guarded(const void* page) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    return VirtualQuery(page, &mbi, sizeof(mbi)) && (mbi.Protect & PAGE_GUARD) != 0;
+}
+
+}  // namespace
+
+int check_console_heap_tail() {
+    g_label = "xs_proxy_mock slot 14 tail";
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    const std::size_t page = si.dwPageSize;
+    const D3D12_DESCRIPTOR_HEAP_DESC pc_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16,
+                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    static_assert(sizeof(D3D12_DESCRIPTOR_HEAP_DESC) == 16, "the PC desc is 16 bytes");
+
+    Mock* mock = nullptr;
+    void* device = make_device(mock, 0, false);
+    EXPECT(device != nullptr);
+
+    // Each case: (factory registered, protection of the page after the desc's page, extra words after the desc
+    // within the page or none). `console` is whether the factory must make the heap.
+    struct Case {
+        const char* name;
+        bool factory;
+        DWORD after;              // protection of the second page
+        bool tail_in_page;        // the 16 extra bytes sit in the first page, after the desc
+        std::uint64_t address;    // the extra words, when tail_in_page
+        std::uint64_t size;
+        bool console;
+    } const cases[] = {
+        {"no factory, desc at a page end, no-access page after", false, PAGE_NOACCESS, false, 0, 0, false},
+        {"no factory, desc at a page end, guard page after", false, PAGE_READWRITE | PAGE_GUARD, false, 0, 0, false},
+        {"no factory, non-zero garbage after the desc", false, PAGE_NOACCESS, true, 0xdeadbeef0000ull, 0x4000, false},
+        {"factory, desc at a page end, no-access page after", true, PAGE_NOACCESS, false, 0, 0, false},
+        {"factory, desc at a page end, guard page after", true, PAGE_READWRITE | PAGE_GUARD, false, 0, 0, false},
+        {"factory, zero address after the desc", true, PAGE_NOACCESS, true, 0, 0x4000, false},
+        {"factory, console address and size after the desc", true, PAGE_NOACCESS, true, 0x7f0000010000ull, 0x8000,
+         true},
+    };
+    for (const Case& c : cases) {
+        g_label = c.name;
+        std::uint8_t* base = two_pages(page, c.after);
+        EXPECT(base != nullptr);
+        const std::size_t offset = page - sizeof(pc_desc) - (c.tail_in_page ? 2 * sizeof(std::uint64_t) : 0);
+        auto* desc = reinterpret_cast<D3D12_DESCRIPTOR_HEAP_DESC*>(base + offset);
+        std::memcpy(desc, &pc_desc, sizeof(pc_desc));
+        if (c.tail_in_page) {
+            std::memcpy(base + offset + sizeof(pc_desc), &c.address, sizeof(c.address));
+            std::memcpy(base + offset + sizeof(pc_desc) + sizeof(c.address), &c.size, sizeof(c.size));
+        }
+        xs::set_console_descriptor_heap_factory(c.factory ? &fake_console_heap_factory : nullptr);
+        g_factory = {};
+        const unsigned device_calls = mock->calls[14];
+
+        void* heap = nullptr;
+        HRESULT hr = E_FAIL;
+        const bool faulted = slot14_faults(device, desc, &heap, &hr);
+        xs::set_console_descriptor_heap_factory(nullptr);
+        EXPECT(!faulted);
+        if ((c.after & PAGE_GUARD) != 0) EXPECT(still_guarded(base + page));
+        EXPECT(hr == S_OK && heap != nullptr && xs::is_heap_proxy(heap));
+        if (c.console) {
+            EXPECT(g_factory.calls == 1 && mock->calls[14] == device_calls);
+            EXPECT(g_factory.desc == desc && g_factory.address == c.address && g_factory.size == c.size);
+        } else {
+            EXPECT(g_factory.calls == 0 && mock->calls[14] == device_calls + 1);
+            EXPECT(mock->args[14][0] == word(desc));
+        }
+        EXPECT(release(heap) == 0);
+        EXPECT(VirtualFree(base, 0, MEM_RELEASE));
+    }
+    g_label = "xs_proxy_mock";
+    EXPECT(release(device) == 0 && mock->refs == 0);
+    std::printf("%s: slot 14 reads past the PC desc only with a factory, and only readable memory\n", g_label);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     no_dialogs();
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1249,7 +1378,8 @@ int main(int argc, char** argv) {
     }
     if (argc != 1) return 2;
     if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
-        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list())
+        check_alloc_failures() || check_allocators() || check_xbox_slots() || check_console_command_list() ||
+        check_console_heap_tail())
         return 1;
     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);
     return 0;

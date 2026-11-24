@@ -1570,8 +1570,10 @@ static bool readable_range(const void* ptr, std::size_t bytes) {
     while (remaining) {
         MEMORY_BASIC_INFORMATION mbi{};
         if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT) return false;
+        // PAGE_GUARD is a modifier bit above the low byte: reading such a page raises a guard-page exception.
+        if (mbi.Protect & PAGE_GUARD) return false;
         const DWORD protect = mbi.Protect & 0xffu;
-        if (protect == PAGE_NOACCESS || protect == PAGE_GUARD || protect == PAGE_EXECUTE) return false;
+        if (protect == PAGE_NOACCESS || protect == PAGE_EXECUTE) return false;
         const auto base = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
         const auto addr = reinterpret_cast<std::uintptr_t>(p);
         const std::size_t avail = static_cast<std::size_t>(base + mbi.RegionSize - addr);
@@ -1593,7 +1595,11 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
     void* created = nullptr;
     HRESULT hr = E_INVALIDARG;
     bool console_extended = false;
-    if (desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
+    // Console-extended slot 14 (issue #313): address/size follow the PC desc. A PC caller passes only the 16-byte
+    // desc and readable memory after it proves nothing, so nothing past the desc is read unless a factory is
+    // registered; with none (the default) the slot is the PC CreateDescriptorHeap.
+    const ConsoleDescriptorHeapFactory factory = g_console_descriptor_heap.load(std::memory_order_acquire);
+    if (factory && desc && desc->Type <= D3D12_DESCRIPTOR_HEAP_TYPE_DSV &&
         (desc->Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) == 0) {
         const auto* bytes = reinterpret_cast<const std::uint8_t*>(desc);
         const void* tail = bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC);
@@ -1602,11 +1608,8 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::uint64_t size = 0;
             std::memcpy(&address, tail, sizeof(address));
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
-            // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
-            // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            const ConsoleDescriptorHeapFactory factory =
-                g_console_descriptor_heap.load(std::memory_order_acquire);
-            if (address != 0 && factory) {
+            // Only a non-zero console VA takes the console path.
+            if (address != 0) {
                 console_extended = true;
                 hr = factory(self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
                              __uuidof(ID3D12DescriptorHeap), &created);
