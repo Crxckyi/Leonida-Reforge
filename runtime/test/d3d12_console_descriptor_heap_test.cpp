@@ -24,6 +24,7 @@ struct Ref {
         return &p;
     }
     T* get() const { return p; }
+    T* operator->() const { return p; }
 };
 
 bool check_console_addressed_heap(ID3D12Device* device) {
@@ -65,7 +66,7 @@ bool check_console_addressed_heap(ID3D12Device* device) {
 
 bool check_xs_proxy_slot14(ID3D12Device* real_device) {
     void* proxy_raw = nullptr;
-    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, IID_PPV_ARGS(&proxy_raw))) || !proxy_raw) {
+    if (FAILED(rt::d3d12_xs::create_device_proxy(real_device, __uuidof(ID3D12Device), &proxy_raw)) || !proxy_raw) {
         std::fprintf(stderr, "create_device_proxy failed\n");
         return false;
     }
@@ -142,7 +143,11 @@ int main() {
 
     if (!check_normal_heap_unchanged(device.get())) return 1;
     if (!check_console_addressed_heap(device.get())) return 1;
-    if (!check_xs_proxy_slot14(device.get())) return 1;
+    // The proxy takes the console path only with a factory registered (LEONIDA_CONSOLE_DESCRIPTOR_HEAPS=1 in gta6rt).
+    rt::d3d12_xs::set_console_descriptor_heap_factory(&rt::d3d12::create_console_descriptor_heap);
+    const bool proxy_ok = check_xs_proxy_slot14(device.get());
+    rt::d3d12_xs::set_console_descriptor_heap_factory(nullptr);
+    if (!proxy_ok) return 1;
     std::fprintf(stderr, "ok\n");
     return 0;
 }
