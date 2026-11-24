@@ -93,7 +93,8 @@ struct Planes {
 // (the layer is given what it recorded; the host runtime must not be given such a list). ExecuteCommandLists refuses
 // a list whose Close failed as a whole, earlier commands included, as D3D12 must not run it either; so with
 // `run_invalid` the clears (and the edge draw) run in a list of their own first, and after a refused resolve list
-// the destination is read back by a third list: a refused resolve must leave the destination as cleared.
+// the destination is read back by a third list, a new one (D3D12's Reset of a list whose Close failed returns that
+// error): a refused resolve must leave the destination as cleared.
 bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run_invalid,
                       const EdgeDraw* edge = nullptr) {
     Ref<ID3D12CommandQueue> queue;
@@ -210,7 +211,7 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
         CHECK(SUCCEEDED(list->Reset(allocator.p, nullptr)));
         return true;
     };
-    const auto copy_planes = [&]() {
+    const auto copy_planes = [&](ID3D12GraphicsCommandList* recording) {
         for (UINT i = 0; i < planes; ++i) {
             D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
             src.pResource = target.p;
@@ -219,7 +220,7 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
             dst.pResource = readback.p;
             dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             dst.PlacedFootprint = placed[i];
-            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+            recording->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
         }
     };
     if (run_invalid) {
@@ -246,18 +247,26 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     list->ResourceBarrier(1, &barriers[1]);
-    copy_planes();
+    copy_planes(list.p);
     out.close = list->Close();
     if (FAILED(out.close) && !run_invalid) return true;
     if (!submit(list.p)) return false;
     if (FAILED(out.close)) {
-        // The refused list ran none of its barriers: the destination is still in DEPTH_WRITE.
-        if (!restart()) return false;
+        // Only the layer is given a list whose Close failed (run_invalid), and it refuses it as a whole.
+        CHECK(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::unsupported);
+        // The refused list ran none of its barriers: the destination is still in DEPTH_WRITE. It is read back by a
+        // new list on a new allocator: D3D12's Reset of a list whose Close failed returns that error again.
+        Ref<ID3D12CommandAllocator> read_allocator;
+        Ref<ID3D12GraphicsCommandList> read_list;
+        CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                       IID_PPV_ARGS(&read_allocator.p))));
+        CHECK(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, read_allocator.p, nullptr,
+                                                 IID_PPV_ARGS(&read_list.p))));
         barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-        list->ResourceBarrier(1, &barriers[1]);
-        copy_planes();
-        CHECK(SUCCEEDED(list->Close()));
-        if (!submit(list.p)) return false;
+        read_list->ResourceBarrier(1, &barriers[1]);
+        copy_planes(read_list.p);
+        CHECK(SUCCEEDED(read_list->Close()));
+        if (!submit(read_list.p)) return false;
     }
     void* mapped = nullptr;
     const D3D12_RANGE range{0, SIZE_T(total)};
