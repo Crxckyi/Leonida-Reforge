@@ -90,7 +90,10 @@ struct Planes {
 
 // Clears a 4x target with three overlapping values and the 1x destination to values none of them have, resolves
 // `c` and reads every plane of the destination back. A list whose Close fails is executed only when `run_invalid`
-// (the layer runs what it recorded; the host runtime must not be given such a list).
+// (the layer is given what it recorded; the host runtime must not be given such a list). ExecuteCommandLists refuses
+// a list whose Close failed as a whole, earlier commands included, as D3D12 must not run it either; so with
+// `run_invalid` the clears (and the edge draw) run in a list of their own first, and after a refused resolve list
+// the destination is read back by a third list: a refused resolve must leave the destination as cleared.
 bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run_invalid,
                       const EdgeDraw* edge = nullptr) {
     Ref<ID3D12CommandQueue> queue;
@@ -98,6 +101,7 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     Ref<ID3D12GraphicsCommandList> list;
     Ref<ID3D12GraphicsCommandList1> list1;
     Ref<ID3D12Fence> fence;
+    UINT64 fence_value = 0;
     D3D12_COMMAND_QUEUE_DESC queue_desc{};
     CHECK(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
     CHECK(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
@@ -187,6 +191,42 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
         list->DrawInstanced(3, 1, 0, 0);
     }
 
+    // Executes `list` and waits for the queue. A list the layer refuses still signals the fence after it.
+    const auto submit = [&](ID3D12GraphicsCommandList* recorded) {
+        ID3D12CommandList* lists[] = {recorded};
+        queue->ExecuteCommandLists(1, lists);
+        CHECK(SUCCEEDED(queue->Signal(fence.p, ++fence_value)));
+        Event event;
+        CHECK(event.handle);
+        CHECK(SUCCEEDED(fence->SetEventOnCompletion(fence_value, event.handle)));
+        // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
+        // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
+        CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
+        return true;
+    };
+    // Starts the next list once the queue has finished the previous one.
+    const auto restart = [&]() {
+        CHECK(SUCCEEDED(allocator->Reset()));
+        CHECK(SUCCEEDED(list->Reset(allocator.p, nullptr)));
+        return true;
+    };
+    const auto copy_planes = [&]() {
+        for (UINT i = 0; i < planes; ++i) {
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.pResource = target.p;
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = i;
+            dst.pResource = readback.p;
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint = placed[i];
+            list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+    };
+    if (run_invalid) {
+        CHECK(SUCCEEDED(list->Close()));
+        if (!submit(list.p) || !restart()) return false;
+    }
+
     D3D12_RESOURCE_BARRIER barriers[2]{};
     for (auto& barrier : barriers) {
         barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -206,27 +246,19 @@ bool resolve_and_read(ID3D12Device* device, const Case& c, Planes& out, bool run
     barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RESOLVE_DEST;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     list->ResourceBarrier(1, &barriers[1]);
-    for (UINT i = 0; i < planes; ++i) {
-        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-        src.pResource = target.p;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex = i;
-        dst.pResource = readback.p;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint = placed[i];
-        list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    }
+    copy_planes();
     out.close = list->Close();
     if (FAILED(out.close) && !run_invalid) return true;
-    ID3D12CommandList* lists[] = {list.p};
-    queue->ExecuteCommandLists(1, lists);
-    CHECK(SUCCEEDED(queue->Signal(fence.p, 1)));
-    Event event;
-    CHECK(event.handle);
-    CHECK(SUCCEEDED(fence->SetEventOnCompletion(1, event.handle)));
-    // 30 s, not 5 s: under `ctest -j 6` other GPU tests share the device, and a fence can take longer
-    // than this test's idle runtime to signal (TEST-514 flake). Sibling tests already wait 15-60 s.
-    CHECK(WaitForSingleObject(event.handle, 30000) == WAIT_OBJECT_0);
+    if (!submit(list.p)) return false;
+    if (FAILED(out.close)) {
+        // The refused list ran none of its barriers: the destination is still in DEPTH_WRITE.
+        if (!restart()) return false;
+        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        list->ResourceBarrier(1, &barriers[1]);
+        copy_planes();
+        CHECK(SUCCEEDED(list->Close()));
+        if (!submit(list.p)) return false;
+    }
     void* mapped = nullptr;
     const D3D12_RANGE range{0, SIZE_T(total)};
     CHECK(SUCCEEDED(readback->Map(0, &range, &mapped)) && mapped);
