@@ -53,6 +53,7 @@ constexpr std::array<std::uint32_t, 35> kMinimalComputeSpv = {
 struct Env {
     ID3D12Device* device = nullptr;
     Ref<ID3D12Resource> buf256;
+    Ref<ID3D12Resource> buf255;
     Ref<ID3D12Resource> count256;
     Ref<ID3D12Resource> buf3;
     Ref<ID3D12Resource> tex;
@@ -76,6 +77,7 @@ struct Env {
                                                              IID_PPV_ARGS(&out.p)));
         };
         CHECK(mkbuf(256, buf256));
+        CHECK(mkbuf(255, buf255));
         CHECK(mkbuf(256, count256));
         CHECK(mkbuf(3, buf3));
 
@@ -128,7 +130,9 @@ struct Env {
 
 struct Case {
     const char* name;
-    bool expected_ok;  // Measured on Windows 11 WARP and RTX 5090 HW D3D12
+    // Measured on Windows 11 build 26300 with WARP and the NVIDIA host driver (RTX 4060 Laptop), which agree on
+    // every row.
+    bool expected_ok;
     std::function<void(Env&)> record;
 };
 
@@ -215,12 +219,17 @@ std::vector<Case> parity_cases() {
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, 260, nullptr, 0); }},
         {"arg_offset=256 ==width (max=0 no-op)", true,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 256, nullptr, 0); }},
-        {"arg_offset=260 >width (max=0 no-op)", false,
+        // max_count 0 reads no argument: the offset is only checked for alignment, not against the width
+        {"arg_offset=260 >width (max=0 no-op)", true,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, 260, nullptr, 0); }},
+        {"arg_buf width=3 off=260 (max=0 no-op)", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf3.p, 260, nullptr, 0); }},
         {"arg_offset=U64MAX-3 wrap (max=1)", false,
          [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, kU64Max - 3, nullptr, 0); }},
-        {"arg_offset=U64MAX-3 aligned (max=0 no-op)", false,
+        {"arg_offset=U64MAX-3 aligned (max=0 no-op)", true,
          [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, kU64Max - 3, nullptr, 0); }},
+        {"arg_offset=U64MAX unaligned (max=0 no-op)", false,
+         [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 0, e.buf256.p, kU64Max, nullptr, 0); }},
         {"arg_offset=U64MAX unaligned+wrap (max=1)", false,
          [=](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf256.p, kU64Max, nullptr, 0); }},
         {"arg_offset=240 max=2 cnt=null (OOB)", false,
@@ -236,17 +245,50 @@ std::vector<Case> parity_cases() {
         {"arg_buf width=3 (max=1 OOB)", false,
          [](Env& e) { e.list->ExecuteIndirect(e.draw16.p, 1, e.buf3.p, 0, nullptr, 0); }},
 
-        // Padded stride: the host bounds max_count * stride, not (max_count - 1) * stride + record_size, so a
-        // record that fits at the end of the buffer while its stride runs past it is refused
-        {"draw stride=20 off=240 max=1 (240+20>256)", false,
+        // Padded stride: the host bounds the bytes the records read, offset + (max_count - 1) * stride + record
+        // size, not max_count * stride, so the last record may end at the buffer's end while its stride runs past
+        // it. One byte past that end (the 255-byte buffer) is refused.
+        {"draw stride=20 off=240 max=1 (240+16==256)", true,
          [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf256.p, 240, nullptr, 0); }},
-        {"draw stride=20 off=220 max=2 (220+40>256)", false,
+        {"draw stride=20 off=240 max=1 width=255 (256>255)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf255.p, 240, nullptr, 0); }},
+        {"draw stride=20 off=244 max=1 (244+16>256)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf256.p, 244, nullptr, 0); }},
+        {"draw stride=20 off=220 max=2 (220+20+16==256)", true,
          [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 2, e.buf256.p, 220, nullptr, 0); }},
-        {"dispatch stride=20 off=244 max=1 (244+20>256)", false,
+        {"draw stride=20 off=220 max=2 width=255 (256>255)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 2, e.buf255.p, 220, nullptr, 0); }},
+        {"draw stride=20 off=224 max=2 (224+20+16>256)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 2, e.buf256.p, 224, nullptr, 0); }},
+        {"draw stride=20 off=0 max=13 (12*20+16==256)", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 13, e.buf256.p, 0, nullptr, 0); }},
+        {"draw stride=20 off=0 max=13 cnt=buf (12*20+16==256)", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 13, e.buf256.p, 0, e.count256.p, 0); }},
+        {"draw stride=20 off=0 max=14 (13*20+16>256)", false,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 14, e.buf256.p, 0, nullptr, 0); }},
+        {"draw stride=20 off=0 max=U32MAX (OOB)", false,
+         [=](Env& e) { e.list->ExecuteIndirect(e.draw20.p, kU32Max, e.buf256.p, 0, nullptr, 0); }},
+        {"draw stride=20 off=U64MAX-15 max=1 (wrap)", false,
+         [=](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 1, e.buf256.p, kU64Max - 15, nullptr, 0); }},
+        {"draw stride=20 off=U64MAX-19 max=2 (wrap)", false,
+         [=](Env& e) { e.list->ExecuteIndirect(e.draw20.p, 2, e.buf256.p, kU64Max - 19, nullptr, 0); }},
+        {"dispatch stride=20 off=244 max=1 (244+12==256)", true,
          [](Env& e) {
              e.bind_compute_if_available();
              e.list->ExecuteIndirect(e.dispatch20.p, 1, e.buf256.p, 244, nullptr, 0);
          }},
+        {"dispatch stride=20 off=244 max=1 width=255 (256>255)", false,
+         [](Env& e) {
+             e.bind_compute_if_available();
+             e.list->ExecuteIndirect(e.dispatch20.p, 1, e.buf255.p, 244, nullptr, 0);
+         }},
+        {"dispatch stride=20 off=248 max=1 (248+12>256)", false,
+         [](Env& e) {
+             e.bind_compute_if_available();
+             e.list->ExecuteIndirect(e.dispatch20.p, 1, e.buf256.p, 248, nullptr, 0);
+         }},
+        {"draw_indexed stride=24 off=236 max=1 (236+20==256)", true,
+         [](Env& e) { e.list->ExecuteIndirect(e.draw_indexed24.p, 1, e.buf256.p, 236, nullptr, 0); }},
         {"draw_indexed stride=24 off=240 max=1 (OOB)", false,
          [](Env& e) { e.list->ExecuteIndirect(e.draw_indexed24.p, 1, e.buf256.p, 240, nullptr, 0); }},
 
@@ -304,9 +346,12 @@ bool run_positive_gpu_dispatch(Env& env) {
     list->ResourceBarrier(1, &to_indirect);
     list->SetComputeRootSignature(env.empty_root.p);
     list->SetPipelineState(env.compute_pso.p);
-    // Exact-fit indirect dispatch (244 + 12 == 256) plus max_command_count == 0 no-op at the buffer's end.
+    // Exact-fit indirect dispatch (244 + 12 == 256), the same record through a padded stride whose 20 bytes run past
+    // the buffer's end (the bytes read still end at 256), and max_command_count == 0 no-ops at and past the end.
     list->ExecuteIndirect(env.dispatch12.p, 1, args.p, 244, nullptr, 0);
+    list->ExecuteIndirect(env.dispatch20.p, 1, args.p, 244, nullptr, 0);
     list->ExecuteIndirect(env.dispatch12.p, 0, args.p, 256, nullptr, 0);
+    list->ExecuteIndirect(env.dispatch12.p, 0, args.p, 260, nullptr, 0);
     CHECK(SUCCEEDED(list->Close()));
 
     ID3D12CommandList* lists[] = {list.p};
@@ -425,12 +470,12 @@ int main() {
     std::filesystem::remove_all(fixture, ec);
 
     unsigned failures = 0;
-    std::printf("%-48s | %-10s | %-10s | %-10s\n", "case", "layer", "WARP", hw_ran ? hw_name.c_str() : "HW");
+    std::printf("%-54s | %-10s | %-10s | %-10s\n", "case", "layer", "WARP", hw_ran ? hw_name.c_str() : "HW");
     for (std::size_t i = 0; i < table.size(); ++i) {
         const bool layer_ok = SUCCEEDED(layer_hr[i]);
         const bool warp_ok = warp_ran ? SUCCEEDED(warp_hr[i]) : table[i].expected_ok;
         const bool hw_ok = hw_ran ? SUCCEEDED(hw_hr[i]) : table[i].expected_ok;
-        std::printf("%-48s | 0x%08lx | %-10s | %-10s\n",
+        std::printf("%-54s | 0x%08lx | %-10s | %-10s\n",
                     table[i].name,
                     static_cast<unsigned long>(layer_hr[i]),
                     warp_ran ? (SUCCEEDED(warp_hr[i]) ? "S_OK" : "FAIL") : (warp_ok ? "(S_OK)" : "(FAIL)"),

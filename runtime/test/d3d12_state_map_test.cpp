@@ -619,9 +619,31 @@ int main() {
         CHECK(!CommandList{}.execute_indirect({IndirectKind::draw, 16, 1, 1, 0, 0, 4}));
         CHECK(rejected({IndirectKind::draw, 16, 2, 1, 112, 0, 0}));
         CHECK(rejected({IndirectKind::draw, 16, 1, 1, 4, 2, 16}));
+        // A padded stride: the bytes read end one stride short of max_count * stride, and one word past them is refused.
+        CHECK(rejected({IndirectKind::draw, 20, 1, 1, 116, 0, 0}));          // 116 + 16 > 128
+        CHECK(rejected({IndirectKind::draw, 20, 2, 1, 96, 2, 0}));           // 96 + 20 + 16 > 128
+        CHECK(rejected({IndirectKind::draw_indexed, 24, 2, 1, 88, 0, 0}));   // 88 + 24 + 20 > 128
+        CHECK(rejected({IndirectKind::dispatch, 20, 2, 1, 100, 0, 0}));      // 100 + 20 + 12 > 128
+        CHECK(rejected({IndirectKind::draw, 20, UINT32_MAX, 1, 0, 0, 0}));
+        CHECK(rejected({IndirectKind::draw, 20, 1, 1, UINT64_MAX - 15, 0, 0}));  // offset + 16 wraps to 0
+        CHECK(rejected({IndirectKind::draw, 20, 2, 1, UINT64_MAX - 19, 0, 0}));
         arguments.buffer_offset = UINT64_MAX - 3;
         CHECK(rejected({IndirectKind::dispatch, 12, 1, 1, 0, 0, 0}));
         CHECK(offsets == expected);
+
+        // The last record may end at the buffer's end while its stride runs past it: D3D12 and Vulkan bound the
+        // bytes the records read, offset + (max_count - 1) * stride + record size.
+        arguments.buffer_offset = 256;
+        offsets.clear();
+        CommandList fit;
+        CHECK(fit.execute_indirect({IndirectKind::draw, 20, 1, 1, 112, 0, 0}));          // 112 + 16 == 128
+        CHECK(fit.execute_indirect({IndirectKind::draw, 20, 2, 1, 92, 2, 0}));           // 92 + 20 + 16 == 128
+        CHECK(fit.execute_indirect({IndirectKind::draw_indexed, 24, 2, 1, 84, 0, 0}));   // 84 + 24 + 20 == 128
+        CHECK(fit.execute_indirect({IndirectKind::dispatch, 20, 2, 1, 96, 0, 0}));       // 96 + 20 + 12 == 128
+        CHECK(fit.close());
+        CHECK(replay(fit, VK_NULL_HANDLE, resolve, vk) == ReplayResult::success);
+        const std::vector<VkDeviceSize> fit_expected{368, 348, 512, 340, 352, 372};
+        CHECK(offsets == fit_expected);
     }
 
     // Resizable BAR detection (D3D-96) on the heap layouts real cards report.

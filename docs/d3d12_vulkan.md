@@ -178,7 +178,7 @@ The command-list surface maps to the IR as follows:
 | `ResourceBarrier` / `Barrier` | barrier command; state tracking |
 | `DiscardResource` / `WriteBufferImmediate` / `AtomicCopyBufferUINT(64)` | discard, immediate-write and atomic-copy commands (section 4.2) |
 | `BeginQuery` / `EndQuery` / `ResolveQueryData` | query commands |
-| `ExecuteIndirect` | command; signature + argument buffer |
+| `ExecuteIndirect` | command; signature + argument buffer. Validated as the PC runtime does (section 4.7): with `MaxCommandCount` > 0 the argument buffer must hold offset + (`MaxCommandCount` - 1) × stride + record size, and with 0 the offset is checked for alignment only |
 | `BeginRenderPass` / `EndRenderPass` | rendering scope |
 | `ExecuteBundle` | play the bundle's state calls and draws on this list, copy its state-free commands in order |
 
@@ -3340,6 +3340,21 @@ Not implemented yet:
   draw-indexed, dispatch and mesh-dispatch signatures map to `vkCmdDraw*Indirect`, `vkCmdDispatchIndirect` and
   `vkCmdDrawMeshTasksIndirectEXT`; use the `*Count` variants (`VK_KHR_draw_indirect_count`, core 1.2) when the
   `ExecuteIndirect` call supplies a count buffer.
+- Argument validation in `ExecuteIndirect` (`leonida::indirect_arguments_fit` in `runtime/src/command_list.h`, used
+  by `runtime/shims/d3d12_com.cpp` when recording and `runtime/src/vulkan_replay.h` when replaying). Measured by
+  `d3d12_execute_indirect_validation_test` on Windows 11 build 26300, where WARP and the NVIDIA host driver (RTX 4060
+  Laptop) agree on all 64 rows: the argument buffer must hold the bytes the records read, offset +
+  (`MaxCommandCount` - 1) × stride + record size (16 for a draw, 20 for an indexed draw, 12 for a dispatch), not
+  `MaxCommandCount` × stride. Offset 240 with stride 20 is accepted in a 256-byte buffer and refused in a 255-byte
+  one; 13 draws of stride 20 fit in 256 bytes, 14 do not. With `MaxCommandCount` 0 nothing is read and the offset is
+  only checked for 4-byte alignment (offsets 260 and 2^64 - 4 in a 256-byte buffer are accepted, 2^64 - 1 is
+  refused); the argument buffer must still be a buffer, and the count buffer is checked as for any count. An earlier
+  recording on an RTX 5090 and WARP under another Windows build refused the padded-stride and the zero-count cases,
+  and the layer had followed it; the live runtime here is the more permissive one, and refusing a call the runtime
+  accepts fails the whole command list. Vulkan bounds the same bytes (`vkCmdDrawIndirect` and
+  `vkCmdDrawIndexedIndirect` with `drawCount` > 1: stride × (`drawCount` - 1) + offset + record size ≤ buffer size;
+  `vkCmdDispatchIndirect`: offset + 12 ≤ size), and the replay checks every recorded call against it, overflow-safe,
+  before any Vulkan call; a zero count is never recorded.
 - Signatures that change root constants, vertex/index buffers or descriptors per argument cannot be expressed by
   one Vulkan indirect call. Use a compute expansion pass that writes a Vulkan-shaped indirect buffer, or
   `VK_NV_device_generated_commands` on NVIDIA. Start with the simple signatures; the trace will show which

@@ -589,6 +589,35 @@ enum class IndirectKind : std::uint8_t {
     dispatch = 2,
 };
 
+// The bytes one record of a single-argument signature reads: D3D12_DRAW_ARGUMENTS, D3D12_DRAW_INDEXED_ARGUMENTS and
+// D3D12_DISPATCH_ARGUMENTS, the layouts of VkDrawIndirectCommand, VkDrawIndexedIndirectCommand and
+// VkDispatchIndirectCommand.
+inline constexpr std::uint64_t indirect_record_bytes(IndirectKind kind) {
+    return kind == IndirectKind::draw           ? 16
+           : kind == IndirectKind::draw_indexed ? 20
+           : kind == IndirectKind::dispatch     ? 12
+                                                : 0;
+}
+
+// Whether max_count records `stride` bytes apart from `offset` fit in `width` bytes. The PC runtime bounds the bytes
+// the records read, offset + (max_count - 1) * stride + record_bytes, not max_count * stride: the last record may end
+// at the buffer's end while its stride runs past it (Windows 11 build 26300, WARP and the NVIDIA driver agree;
+// d3d12_execute_indirect_validation_test). vkCmdDraw*Indirect and vkCmdDispatchIndirect bound the same bytes.
+// max_count 0 reads nothing, and the runtime then checks no offset against the width. No input overflows.
+inline constexpr bool indirect_arguments_fit(std::uint64_t width, std::uint64_t offset, std::uint32_t stride,
+                                             std::uint64_t record_bytes, std::uint32_t max_count) {
+    if (!max_count) return true;
+    return stride && record_bytes && offset <= width && record_bytes <= width - offset &&
+           std::uint64_t(max_count - 1) <= (width - offset - record_bytes) / stride;
+}
+
+// The bytes from `offset` that those records read (0 for max_count 0); below 2^64 since stride and max_count are
+// 32-bit and record_bytes is at most a stride.
+inline constexpr std::uint64_t indirect_argument_span(std::uint32_t stride, std::uint64_t record_bytes,
+                                                      std::uint32_t max_count) {
+    return max_count ? std::uint64_t(max_count - 1) * stride + record_bytes : 0;
+}
+
 struct ExecuteIndirect {
     IndirectKind kind = IndirectKind::draw;
     std::uint32_t stride = 0;

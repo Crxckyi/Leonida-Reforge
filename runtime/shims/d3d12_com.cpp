@@ -835,17 +835,19 @@ public:
             return check(false);
         }
         // The record size is checked for every call: D3D12 rejects a signature whose stride cannot hold a record
-        // even when no command runs. The argument span is what the signature can walk, max_command_count * stride:
-        // the host refuses a range that ends past the buffer (`240` with stride `20` in a `256`-byte buffer), and
-        // it checks the offset itself when max_command_count is 0, where the required bytes are none.
-        const UINT64 record_size =
-            kind == leonida::IndirectKind::draw ? sizeof(D3D12_DRAW_ARGUMENTS)
-            : kind == leonida::IndirectKind::draw_indexed ? sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)
-            : kind == leonida::IndirectKind::dispatch ? sizeof(D3D12_DISPATCH_ARGUMENTS)
-            : 0;
+        // even when no command runs. The buffer must hold the bytes the records read, offset + (max_command_count -
+        // 1) * stride + record size: the host takes offset `240` with stride `20` in a `256`-byte buffer and refuses
+        // it in a `255`-byte one, and with max_command_count 0 it checks no offset against the width
+        // (leonida::indirect_arguments_fit).
+        static_assert(leonida::indirect_record_bytes(leonida::IndirectKind::draw) == sizeof(D3D12_DRAW_ARGUMENTS) &&
+                      leonida::indirect_record_bytes(leonida::IndirectKind::draw_indexed) ==
+                          sizeof(D3D12_DRAW_INDEXED_ARGUMENTS) &&
+                      leonida::indirect_record_bytes(leonida::IndirectKind::dispatch) ==
+                          sizeof(D3D12_DISPATCH_ARGUMENTS));
+        const UINT64 record_size = leonida::indirect_record_bytes(kind);
         if (!record_size || stride < record_size || stride % 4 != 0) return check(false);
-        if (argument_buffer_offset > arg_desc.Width ||
-            UINT64(max_command_count) > (arg_desc.Width - argument_buffer_offset) / stride)
+        if (!leonida::indirect_arguments_fit(arg_desc.Width, argument_buffer_offset, stride, record_size,
+                                             max_command_count))
             return check(false);
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
