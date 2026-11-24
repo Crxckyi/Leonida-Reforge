@@ -108,6 +108,17 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler);
 using PlacedAtVaPagesHook = bool (*)(const void* va, std::size_t bytes);
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook);
 
+// Device slot 14 (CreateDescriptorHeap) with the console's two extra words, address and size after the PC desc
+// (issue #313): the heap must start at `address`. The proxy does not make it itself: the device behind it does,
+// through this factory, which the Vulkan layer registers (rt::d3d12::create_console_descriptor_heap). Kept as a
+// registered pointer, as set_placed_at_va_handler is, so this file needs no Vulkan header and builds into the proxy
+// tests without the Vulkan layer. With none registered the slot makes an ordinary PC heap, as before the console
+// path existed. The Vulkan Device registers it only with LEONIDA_CONSOLE_DESCRIPTOR_HEAPS=1 (see runtime/README.md).
+using ConsoleDescriptorHeapFactory = HRESULT (*)(ID3D12Device* real, const D3D12_DESCRIPTOR_HEAP_DESC* desc,
+                                                 D3D12_GPU_VIRTUAL_ADDRESS address, std::uint64_t size, REFIID riid,
+                                                 void** out);
+void set_console_descriptor_heap_factory(ConsoleDescriptorHeapFactory factory);
+
 // True for slots the proxy handles itself rather than forwarding verbatim: IUnknown (0-2), 8 and 75 (queue
 // proxies), 9 (allocator proxies), 14, 31/34/35/45/46/50 (proxies unwrapped), 32 and 36 (fence proxies), 48/73 and
 // 78/79/80 (the Xbox slots above, at their configured indices), 62, 67 and 76. Slot 10 is intentionally false: the

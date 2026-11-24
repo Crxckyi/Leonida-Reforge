@@ -5008,6 +5008,16 @@ public:
         // standalone device gta6rt --run uses both come through here (found in review: registering only in
         // create_vulkan_device left the retail path without it).
         rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+        // Slot 14's console-addressed descriptor heaps (issue #313 of the original project), only when
+        // LEONIDA_CONSOLE_DESCRIPTOR_HEAPS=1: the slot reads 16 bytes past the PC description for the console address,
+        // and a caller that passes a plain PC description (every D3D12 test that goes through the proxy) has
+        // whatever follows it there, so a non-zero leftover made a heap at a garbage address and the test crashed.
+        {
+            char text[4] = {};
+            size_t length = 0;
+            if (getenv_s(&length, text, "LEONIDA_CONSOLE_DESCRIPTOR_HEAPS") == 0 && length > 1 && text[0] != '0')
+                rt::d3d12_xs::set_console_descriptor_heap_factory(&create_console_descriptor_heap);
+        }
         state_.info = info;
         queue_users_.resize(info.command_queues.size(), 0);
         compute_users_.resize(info.compute_queues.size(), 0);

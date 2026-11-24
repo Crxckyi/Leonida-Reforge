@@ -123,6 +123,15 @@ defaults one of them hooks the process: the package DLLs mapped after it then fa
 `TOMBOX_GDK_EARLY=0 TOMBOX_GDK_RUNTIME=0 TOMBOX_OSHOST=0 TOMBOX_PAD=0 TOMBOX_TIMER_1MS=0` they map; their network
 guard stays on and denies all traffic. `loader_test` covers the step with a synthetic DLL (no game data).
 
+### Console-addressed descriptor heaps: `LEONIDA_CONSOLE_DESCRIPTOR_HEAPS`
+
+Xbox device slot 14 (`CreateDescriptorHeap`) can carry the console's address and size after the 16-byte PC
+description, and the heap must then start at that address (issue #313 of the original project). The proxy reads those
+16 bytes and, when the address is non-zero, asks the Vulkan layer for such a heap. A caller that passes a plain PC
+description has unrelated bytes there, which made heaps at garbage addresses (`d3d12_draw`, `d3d12_descriptor` and
+`d3d12_f16_halves` crashed), so the path is off unless `LEONIDA_CONSOLE_DESCRIPTOR_HEAPS=1`; with it off the slot
+makes an ordinary heap. Whether the retail title needs it is not measured yet.
+
 ### Repeatable random bytes: `LEONIDA_RNG_SEED`
 
 With `LEONIDA_RNG_SEED=<number>` (decimal, or hexadecimal with `0x`; read once when the `bcrypt` shim starts),

@@ -1560,6 +1560,9 @@ HRESULT proxy_unwrapping_call(DeviceProxy* self, std::uint64_t a1, std::uint64_t
     return static_cast<HRESULT>(static_cast<std::uint32_t>(forward_device<Slot>(self, r1, r2, r3, r4, a5)));
 }
 
+// Slot 14's console-addressed heaps, made by the device behind the proxy (set_console_descriptor_heap_factory).
+std::atomic<ConsoleDescriptorHeapFactory> g_console_descriptor_heap{nullptr};
+
 static bool readable_range(const void* ptr, std::size_t bytes) {
     if (!ptr || !bytes) return false;
     const auto* p = static_cast<const std::uint8_t*>(ptr);
@@ -1601,11 +1604,12 @@ HRESULT proxy_create_descriptor_heap(DeviceProxy* self, const D3D12_DESCRIPTOR_H
             std::memcpy(&size, bytes + sizeof(D3D12_DESCRIPTOR_HEAP_DESC) + sizeof(address), sizeof(size));
             // Console-extended slot 14 (issue #313): address/size follow the PC desc. Only take this path when a
             // non-zero console VA is present; normal PC 16-byte descs never enter it.
-            if (address != 0) {
+            const ConsoleDescriptorHeapFactory factory =
+                g_console_descriptor_heap.load(std::memory_order_acquire);
+            if (address != 0 && factory) {
                 console_extended = true;
-                hr = rt::d3d12::create_console_descriptor_heap(
-                    self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
-                    __uuidof(ID3D12DescriptorHeap), &created);
+                hr = factory(self->real, desc, static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(address), size,
+                             __uuidof(ID3D12DescriptorHeap), &created);
             }
         }
     }
@@ -2039,6 +2043,10 @@ void set_placed_at_va_handler(PlacedAtVaHandler handler) {
 
 void set_placed_at_va_pages_hook(PlacedAtVaPagesHook hook) {
     g_placed_at_va_pages.store(hook, std::memory_order_release);
+}
+
+void set_console_descriptor_heap_factory(ConsoleDescriptorHeapFactory factory) {
+    g_console_descriptor_heap.store(factory, std::memory_order_release);
 }
 
 ID3D12Device* device_proxy_real_device(const void* device) {
