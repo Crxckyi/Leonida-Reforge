@@ -4,14 +4,17 @@
 // GetCopyableFootprints1 with GetCopyableFootprints. The device is called directly, not through the Xbox-ABI proxy,
 // because the proxy's slot 76 is the Xbox texture method, not CreateCommittedResource3 (docs/d3d12_vulkan.md
 // section 7). The newer arguments' edge cases are checked against the PC runtime's answers, live when the host has
-// a D3D12 device. A texture from CreateCommittedResource3 goes through an upload, a copy and a readback on a queue
-// from CreateCommandQueue1. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails.
+// a D3D12 device: the one on the layer's own adapter (host_adapter.h), since on a PC with two GPUs the default
+// adapter can be the other GPU, whose driver answers some cases differently. A texture from CreateCommittedResource3
+// goes through an upload, a copy and a readback on a queue from CreateCommandQueue1. No shaders or game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation; any validation error fails.
 #include "vk_test_device.h"
+#include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #define EXPECT(condition) do { \
@@ -529,13 +532,15 @@ int main() {
 
         // The newer arguments' edge cases, each with the answer the PC runtime gives (and, when the host has a
         // D3D12 device, compared with it live). Placed cases use standalone_device so the heap arena is present.
-        const HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        const auto create_host = d3d12 ? reinterpret_cast<PFN_D3D12_CREATE_DEVICE>(
-                                             reinterpret_cast<void*>(GetProcAddress(d3d12, "D3D12CreateDevice")))
-                                       : nullptr;
+        // The host device runs on the layer's adapter, not the default one (hostadapter::reference).
+        Ref<IDXGIFactory4> factory;
+        Ref<IDXGIAdapter> adapter;
+        std::string adapter_name;
         Ref<ID3D12Device10> host;
-        const bool have_host = create_host && !hostwine::host_is_wine() &&
-                               SUCCEEDED(create_host(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)));
+        const bool have_host = !hostwine::host_is_wine() && SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory.p))) &&
+                               hostadapter::reference(factory.p, d, false, &adapter.p, adapter_name) &&
+                               SUCCEEDED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&host.p)));
+        if (have_host) std::printf("host runtime compared on %s\n", adapter_name.c_str());
         Ref<ID3D12Device> standalone_base;
         Ref<ID3D12Device10> standalone_device;
         EXPECT(SUCCEEDED(rt::d3d12::create_vulkan_device_standalone(IID_PPV_ARGS(&standalone_base.p))));

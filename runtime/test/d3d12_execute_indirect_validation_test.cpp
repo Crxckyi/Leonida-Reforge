@@ -1,8 +1,11 @@
 // Host-parity validation and GPU execution sanity test for ID3D12GraphicsCommandList::ExecuteIndirect.
 // Compares Close() verdicts between the Vulkan layer, live Windows WARP, and live hardware D3D12 (0 disagreements),
-// then executes valid ExecuteIndirect dispatches on the Vulkan GPU with validation enabled. No game data.
+// then executes valid ExecuteIndirect dispatches on the Vulkan GPU with validation enabled. The hardware side runs
+// on the layer's own adapter (host_adapter.h): on a PC with two GPUs the default adapter can be the other GPU.
+// No game data.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
+#include "host_adapter.h"
 #include "host_wine.h"
 #include "../shims/d3d12_com.h"
 #include "../src/shader_library.h"
@@ -404,24 +407,16 @@ int main() {
                 REQUIRE(warp_dev->GetDeviceRemovedReason() == S_OK);
                 warp_ran = true;
             }
-            for (UINT i = 0;; ++i) {
-                Ref<IDXGIAdapter1> adapter;
-                if (factory->EnumAdapters1(i, &adapter.p) == DXGI_ERROR_NOT_FOUND) break;
-                DXGI_ADAPTER_DESC1 desc{};
-                adapter->GetDesc1(&desc);
-                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-                Ref<ID3D12Device> hw_dev;
-                if (SUCCEEDED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&hw_dev.p)))) {
-                    Env env;
-                    REQUIRE(env.init(hw_dev.p));
-                    for (std::size_t j = 0; j < table.size(); ++j) REQUIRE(run_case(env, table[j], hw_hr[j]));
-                    REQUIRE(hw_dev->GetDeviceRemovedReason() == S_OK);
-                    char name_buf[256]{};
-                    std::snprintf(name_buf, sizeof(name_buf), "%ls", desc.Description);
-                    hw_name = name_buf;
-                    hw_ran = true;
-                    break;
-                }
+            // The hardware column: the host driver of the GPU the layer runs on (hostadapter::reference).
+            Ref<IDXGIAdapter> adapter;
+            Ref<ID3D12Device> hw_dev;
+            if (hostadapter::reference(factory.p, vk, false, &adapter.p, hw_name) &&
+                SUCCEEDED(D3D12CreateDevice(adapter.p, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&hw_dev.p)))) {
+                Env env;
+                REQUIRE(env.init(hw_dev.p));
+                for (std::size_t j = 0; j < table.size(); ++j) REQUIRE(run_case(env, table[j], hw_hr[j]));
+                REQUIRE(hw_dev->GetDeviceRemovedReason() == S_OK);
+                hw_ran = true;
             }
         }
     }
